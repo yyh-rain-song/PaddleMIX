@@ -12,55 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """ Paddle Emu3 model."""
-import math
+
 import warnings
 from typing import List, Optional, Tuple, Union
 
 import paddle
 import paddle.nn.functional as F
 from paddle import nn
-
 from paddlenlp.transformers.activations import ACT2FN
-from paddle.nn import MultiHeadAttention
-# from transformers.cache_utils import Cache, DynamicCache
-# from transformers.modeling_attn_mask_utils import (
-#     AttentionMaskConverter,
-#     _prepare_4d_attention_mask,
-#     _prepare_4d_causal_attention_mask,
-#     _prepare_4d_causal_attention_mask_for_sdpa,
-# )
-from paddlenlp.transformers.model_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
+from paddlenlp.transformers.model_outputs import (
+    BaseModelOutputWithPast,
+    CausalLMOutputWithPast,
+)
 from paddlenlp.transformers.model_utils import PretrainedModel
-#from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS, is_torch_greater_or_equal_than_1_13
-# from transformers.utils import (
-#     add_start_docstrings,
-#     add_start_docstrings_to_model_forward,
-#     is_flash_attn_2_available,
-#     is_flash_attn_greater_or_equal_2_10,
-#     logging,
-#     replace_return_docstrings,
-# )
-# from transformers.utils.import_utils import is_torch_fx_available
+
+from ...utils.log import logger
 from .configuration_emu3 import Emu3Config
 
-
-#if is_flash_attn_2_available():
-# from flash_attn import flash_attn_func, flash_attn_varlen_func
-# from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input  # noqa
-
-
-# This makes `_prepare_4d_causal_attention_mask` a leaf function in the FX graph.
-# It means that the function will not be traced through and simply appear as a node in the graph.
-# if is_torch_fx_available():
-#     if not is_torch_greater_or_equal_than_1_13:
-#         import torch.fx
-
-#     _prepare_4d_causal_attention_mask = torch.fx.wrap(_prepare_4d_causal_attention_mask)
-
-from ppdiffusers.utils import logging
-logger = logging.get_logger(__name__)
-
-#_CONFIG_FOR_DOC = "Emu3Config"
 
 def _get_unpad_data(attention_mask):
     seqlens_in_batch = attention_mask.sum(axis=-1, dtype="int32")
@@ -117,8 +85,7 @@ class Emu3RMSNorm(nn.Layer):
         Emu3RMSNorm is equivalent to T5LayerNorm
         """
         super().__init__()
-        self.weight = paddle.base.framework.EagerParamBase.from_tensor(tensor
-            =paddle.ones(shape=hidden_size))
+        self.weight = paddle.base.framework.EagerParamBase.from_tensor(tensor=paddle.ones(shape=hidden_size))
         self.variance_epsilon = epsilon
 
     def forward(self, hidden_states):
@@ -129,39 +96,32 @@ class Emu3RMSNorm(nn.Layer):
         return self.weight * hidden_states.to(input_dtype)
 
 
-# ALL_LAYERNORM_LAYERS.append(Emu3RMSNorm)
-
-
 class Emu3RotaryEmbedding(nn.Layer):
     def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
         super().__init__()
         self.dim = dim
         self.max_position_embeddings = max_position_embeddings
         self.base = base
-        inv_freq = 1.0 / self.base ** (paddle.arange(start=0, end=self.dim,
-            step=2).astype(dtype='float32').to(device) / self.dim)
-        self.register_buffer(name='inv_freq', tensor=inv_freq, persistable=
-            False)
-        self._set_cos_sin_cache(seq_len=max_position_embeddings, device=
-            self.inv_freq.place, dtype=paddle.get_default_dtype())
+        inv_freq = 1.0 / self.base ** (
+            paddle.arange(start=0, end=self.dim, step=2).astype(dtype="float32").to(device) / self.dim
+        )
+        self.register_buffer(name="inv_freq", tensor=inv_freq, persistable=False)
+        self._set_cos_sin_cache(
+            seq_len=max_position_embeddings, device=self.inv_freq.place, dtype=paddle.get_default_dtype()
+        )
 
     def _set_cos_sin_cache(self, seq_len, device, dtype):
         self.max_seq_len_cached = seq_len
-        t = paddle.arange(dtype=self.inv_freq.dtype, end=self.
-            max_seq_len_cached)
+        t = paddle.arange(dtype=self.inv_freq.dtype, end=self.max_seq_len_cached)
         freqs = paddle.outer(x=t, y=self.inv_freq)
         emb = paddle.concat(x=(freqs, freqs), axis=-1)
-        self.register_buffer(name='cos_cached', tensor=emb.cos().to(dtype),
-            persistable=False)
-        self.register_buffer(name='sin_cached', tensor=emb.sin().to(dtype),
-            persistable=False)
+        self.register_buffer(name="cos_cached", tensor=emb.cos().to(dtype), persistable=False)
+        self.register_buffer(name="sin_cached", tensor=emb.sin().to(dtype), persistable=False)
 
     def forward(self, x, seq_len=None):
         if seq_len > self.max_seq_len_cached:
-            self._set_cos_sin_cache(seq_len=seq_len, device=x.place, dtype=
-                x.dtype)
-        return self.cos_cached[:seq_len].to(dtype=x.dtype), self.sin_cached[:
-            seq_len].to(dtype=x.dtype)
+            self._set_cos_sin_cache(seq_len=seq_len, device=x.place, dtype=x.dtype)
+        return self.cos_cached[:seq_len].to(dtype=x.dtype), self.sin_cached[:seq_len].to(dtype=x.dtype)
 
 
 class Emu3LinearScalingRotaryEmbedding(Emu3RotaryEmbedding):
@@ -173,15 +133,12 @@ class Emu3LinearScalingRotaryEmbedding(Emu3RotaryEmbedding):
 
     def _set_cos_sin_cache(self, seq_len, device, dtype):
         self.max_seq_len_cached = seq_len
-        t = paddle.arange(dtype=self.inv_freq.dtype, end=self.
-            max_seq_len_cached)
+        t = paddle.arange(dtype=self.inv_freq.dtype, end=self.max_seq_len_cached)
         t = t / self.scaling_factor
         freqs = paddle.outer(x=t, y=self.inv_freq)
         emb = paddle.concat(x=(freqs, freqs), axis=-1)
-        self.register_buffer(name='cos_cached', tensor=emb.cos().to(dtype),
-            persistable=False)
-        self.register_buffer(name='sin_cached', tensor=emb.sin().to(dtype),
-            persistable=False)
+        self.register_buffer(name="cos_cached", tensor=emb.cos().to(dtype), persistable=False)
+        self.register_buffer(name="sin_cached", tensor=emb.sin().to(dtype), persistable=False)
 
 
 class Emu3DynamicNTKScalingRotaryEmbedding(Emu3RotaryEmbedding):
@@ -194,21 +151,18 @@ class Emu3DynamicNTKScalingRotaryEmbedding(Emu3RotaryEmbedding):
     def _set_cos_sin_cache(self, seq_len, device, dtype):
         self.max_seq_len_cached = seq_len
         if seq_len > self.max_position_embeddings:
-            base = self.base * (self.scaling_factor * seq_len / self.
-                max_position_embeddings - (self.scaling_factor - 1)) ** (self
-                .dim / (self.dim - 2))
-            inv_freq = 1.0 / base ** (paddle.arange(start=0, end=self.dim,
-                step=2).astype(dtype='float32').to(device) / self.dim)
-            self.register_buffer(name='inv_freq', tensor=inv_freq,
-                persistable=False)
-        t = paddle.arange(dtype=self.inv_freq.dtype, end=self.
-            max_seq_len_cached)
+            base = self.base * (
+                self.scaling_factor * seq_len / self.max_position_embeddings - (self.scaling_factor - 1)
+            ) ** (self.dim / (self.dim - 2))
+            inv_freq = 1.0 / base ** (
+                paddle.arange(start=0, end=self.dim, step=2).astype(dtype="float32").to(device) / self.dim
+            )
+            self.register_buffer(name="inv_freq", tensor=inv_freq, persistable=False)
+        t = paddle.arange(dtype=self.inv_freq.dtype, end=self.max_seq_len_cached)
         freqs = paddle.outer(x=t, y=self.inv_freq)
         emb = paddle.concat(x=(freqs, freqs), axis=-1)
-        self.register_buffer(name='cos_cached', tensor=emb.cos().to(dtype),
-            persistable=False)
-        self.register_buffer(name='sin_cached', tensor=emb.sin().to(dtype),
-            persistable=False)
+        self.register_buffer(name="cos_cached", tensor=emb.cos().to(dtype), persistable=False)
+        self.register_buffer(name="sin_cached", tensor=emb.sin().to(dtype), persistable=False)
 
 
 def rotate_half(x):
@@ -222,11 +176,11 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
     """Applies Rotary Position Embedding to the query and key tensors.
 
     Args:
-        q (`torch.Tensor`): The query tensor.
-        k (`torch.Tensor`): The key tensor.
-        cos (`torch.Tensor`): The cosine part of the rotary embedding.
-        sin (`torch.Tensor`): The sine part of the rotary embedding.
-        position_ids (`torch.Tensor`):
+        q (`paddle.Tensor`): The query tensor.
+        k (`paddle.Tensor`): The key tensor.
+        cos (`paddle.Tensor`): The cosine part of the rotary embedding.
+        sin (`paddle.Tensor`): The sine part of the rotary embedding.
+        position_ids (`paddle.Tensor`):
             The position indices of the tokens corresponding to the query and key tensors. For example, this can be
             used to pass offsetted position ids when working with a KV-cache.
         unsqueeze_dim (`int`, *optional*, defaults to 1):
@@ -237,7 +191,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
             cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
             the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
     Returns:
-        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
+        `tuple(paddle.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
     """
     cos = cos[position_ids].unsqueeze(unsqueeze_dim)
     sin = sin[position_ids].unsqueeze(unsqueeze_dim)
@@ -261,7 +215,7 @@ class Emu3MLP(nn.Layer):
         try:
             down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
         except:
-            x = x.cast(paddle.bfloat16)
+            x = x.astype(self.up_proj.weight.dtype)
             down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
         return down_proj
 
@@ -286,10 +240,11 @@ class Emu3Attention(nn.Layer):
         self.config = config
         self.layer_idx = layer_idx
         if layer_idx is None:
-            logger.warning_once(
-                f"Instantiating {self.__class__.__name__} without passing `layer_idx` is not recommended and will "
+            logger(
+                log_level=30,
+                msg=f"Instantiating {self.__class__.__name__} without passing `layer_idx` is not recommended and will "
                 "to errors during the forward call, if caching is used. Please make sure to provide a `layer_idx` "
-                "when creating this class."
+                "when creating this class.",
             )
 
         self.attention_dropout = config.attention_dropout
@@ -349,56 +304,39 @@ class Emu3Attention(nn.Layer):
         hidden_states: paddle.Tensor,
         attention_mask: Optional[paddle.Tensor] = None,
         position_ids: Optional[paddle.Tensor] = None,
-        past_key_value: Optional[MultiHeadAttention.Cache] = None,
+        past_key_value: Optional[Tuple[paddle.Tensor]] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
         cache_position: Optional[paddle.Tensor] = None,
         **kwargs,
     ):
-        # if "padding_mask" in kwargs:
-        #     warnings.warn(
-        #         "Passing `padding_mask` is deprecated and will be removed in v4.37. Please make sure use `attention_mask` instead.`"
-        #     )
 
-        bsz, q_len, _ = hidden_states.shape # [1, 4188, 4096]
+        bsz, q_len, _ = hidden_states.shape  # [1, 4188, 4096]
 
         try:
-            query_states = self.q_proj(hidden_states) # 4096->1024
+            query_states = self.q_proj(hidden_states)  # 4096->1024
             key_states = self.k_proj(hidden_states)
             value_states = self.v_proj(hidden_states)
         except:
-            hidden_states = hidden_states.astype("bfloat16")
+            hidden_states = hidden_states.astype(self.q_proj.weight.dtype)
             query_states = self.q_proj(hidden_states)
             key_states = self.k_proj(hidden_states)
             value_states = self.v_proj(hidden_states)
 
         query_states = query_states.reshape([bsz, q_len, self.num_heads, self.head_dim]).transpose([0, 2, 1, 3])
         key_states = key_states.reshape([bsz, q_len, self.num_key_value_heads, self.head_dim]).transpose([0, 2, 1, 3])
-        value_states = value_states.reshape([bsz, q_len, self.num_key_value_heads, self.head_dim]).transpose([0, 2, 1, 3])
+        value_states = value_states.reshape([bsz, q_len, self.num_key_value_heads, self.head_dim]).transpose(
+            [0, 2, 1, 3]
+        )
 
-        kv_seq_len = key_states.shape[-2] # [bs, num_head, seq_len, head_dim]
+        kv_seq_len = key_states.shape[-2]  # [bs, num_head, seq_len, head_dim]
         if past_key_value is not None:
-            # if self.layer_idx is None:
-            #     raise ValueError(
-            #         f"The cache structure has changed since version v4.36. If you are using {self.__class__.__name__} "
-            #         "for auto-regressive decoding with k/v caching, please make sure to initialize the attention class "
-            #         "with a layer index."
-            #     )
-            #kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
-            #kv_seq_len += past_key_value[0].shape[-3]
             kv_seq_len += int(cache_position[0]) + 1
 
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-        query_states, key_states = apply_rotary_pos_emb(
-            query_states, key_states, cos, sin, position_ids
-        )
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
-        #print('key_states.shape ', key_states.shape)
         if past_key_value is not None:
-            #import pdb; pdb.set_trace()
-            #print('past_key_value[0].shape', past_key_value[0].shape)
-            # cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
-            # key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
             key_states = paddle.concat([past_key_value[0], key_states], axis=2)
             value_states = paddle.concat([past_key_value[1], value_states], axis=2)
         past_key_value = (key_states, value_states) if use_cache else None
@@ -407,27 +345,35 @@ class Emu3Attention(nn.Layer):
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
-        attn_weights = paddle.matmul(query_states, key_states.transpose([0, 1, 3, 2])) / math.sqrt(self.head_dim)
+        attn_output = F.scaled_dot_product_attention(
+            query_states.transpose([0, 2, 1, 3]),
+            key_states.transpose([0, 2, 1, 3]),
+            value_states.transpose([0, 2, 1, 3]),
+            attn_mask=attention_mask,
+            training=self.training,
+        )
+        # naive attention
+        # attn_weights = paddle.matmul(query_states, key_states.transpose([0, 1, 3, 2])) / math.sqrt(self.head_dim)
 
         # if tuple(attn_weights.shape) != (bsz, self.num_heads, q_len, kv_seq_len):
         #     raise ValueError(
         #         f'Attention weights should be of size {bsz, self.num_heads, q_len, kv_seq_len}, but is {tuple(attn_weights.shape)}'
         #     )
-        if attention_mask is not None:
-            attn_weights = attn_weights + attention_mask
+        # if attention_mask is not None:
+        # attn_weights = attn_weights + attention_mask
 
         # upcast attention to fp32
-        attn_weights = F.softmax(attn_weights, axis=-1,dtype='float32').to(query_states.dtype)
-        attn_weights = F.dropout(attn_weights, p=self.attention_dropout, training=self.training)
+        # attn_weights = F.softmax(attn_weights, axis=-1,dtype='float32').to(query_states.dtype)
+        # attn_weights = F.dropout(attn_weights, p=self.attention_dropout, training=self.training)
 
-        attn_output = paddle.matmul(attn_weights, value_states)
+        # attn_output = paddle.matmul(attn_weights, value_states)
 
-        if tuple(attn_output.shape) != (bsz, self.num_heads, q_len, self.head_dim):
-            raise ValueError(
-                f'`attn_output` should be of size {bsz, self.num_heads, q_len, self.head_dim}, but is {tuple(attn_output.shape)}'
-            )
+        # if tuple(attn_output.shape) != (bsz, self.num_heads, q_len, self.head_dim):
+        #     raise ValueError(
+        #         f'`attn_output` should be of size {bsz, self.num_heads, q_len, self.head_dim}, but is {tuple(attn_output.shape)}'
+        #     )
 
-        attn_output = attn_output.transpose([0, 2, 1, 3])
+        # attn_output = attn_output.transpose([0, 2, 1, 3])
         attn_output = attn_output.reshape([bsz, q_len, self.hidden_size])
         attn_output = self.o_proj(attn_output)
         if not output_attentions:
@@ -445,12 +391,16 @@ class Emu3FlashAttention2(Emu3Attention):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-    def forward(self, hidden_states: paddle.Tensor, attention_mask:
-        Optional[paddle.Tensor]=None, position_ids: Optional[paddle.Tensor]
-        =None, past_key_value: Optional[MultiHeadAttention.Cache]=
-        None, output_attentions: bool=False, use_cache: bool=False, **kwargs
+    def forward(
+        self,
+        hidden_states: paddle.Tensor,
+        attention_mask: Optional[paddle.Tensor] = None,
+        position_ids: Optional[paddle.Tensor] = None,
+        past_key_value: Optional[Tuple[paddle.Tensor]] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        **kwargs
     ):
-        # Emu3FlashAttention2 attention does not support output_attentions
         if "padding_mask" in kwargs:
             warnings.warn(
                 "Passing `padding_mask` is deprecated and will be removed in v4.37. Please make sure use `attention_mask` instead.`"
@@ -471,7 +421,9 @@ class Emu3FlashAttention2(Emu3Attention):
         # therefore we just need to keep the original shape
         query_states = query_states.reshape([bsz, q_len, self.num_heads, self.head_dim]).transpose([0, 2, 1, 3])
         key_states = key_states.reshape([bsz, q_len, self.num_key_value_heads, self.head_dim]).transpose([0, 2, 1, 3])
-        value_states = value_states.reshape([bsz, q_len, self.num_key_value_heads, self.head_dim]).transpose([0, 2, 1, 3])
+        value_states = value_states.reshape([bsz, q_len, self.num_key_value_heads, self.head_dim]).transpose(
+            [0, 2, 1, 3]
+        )
 
         kv_seq_len = key_states.shape[-2]
         if past_key_value is not None:
@@ -486,8 +438,8 @@ class Emu3FlashAttention2(Emu3Attention):
         # TODO: These transpose are quite inefficient but Flash Attention requires the layout [batch_size, sequence_length, num_heads, head_dim]. We would need to refactor the KV cache
         # to be able to avoid many of these transpose/reshape/view.
         query_states = query_states.transpose([0, 2, 1, 3])
-        key_states = key_states.transpose([0, 2, 1, 3]) #transpose(1, 2)
-        value_states = value_states.transpose([0, 2, 1, 3]) #transpose(1, 2)
+        key_states = key_states.transpose([0, 2, 1, 3])  # transpose(1, 2)
+        value_states = value_states.transpose([0, 2, 1, 3])  # transpose(1, 2)
 
         dropout_rate = self.attention_dropout if self.training else 0.0
 
@@ -497,7 +449,7 @@ class Emu3FlashAttention2(Emu3Attention):
         # This might slowdown training & inference so it is recommended to not cast the LayerNorms
         # in fp32. (Emu3RMSNorm handles it correctly)
 
-        input_dtype = query_states.dtype
+        # input_dtype = query_states.dtype
         # if input_dtype == paddle.float32:
         #     # Handle the case where the model is quantized
         #     if hasattr(self.config, "_pre_quantization_dtype"):
@@ -557,15 +509,14 @@ class Emu3FlashAttention2(Emu3Attention):
 
         # Contains at least one padding token in the sequence
         if attention_mask is not None:
-            batch_size = query_states.shape[0]
             query_states, key_states, value_states, indices_q, cu_seq_lens, max_seq_lens = self._upad_input(
                 query_states, key_states, value_states, attention_mask, query_length
             )
 
             cu_seqlens_q, cu_seqlens_k = cu_seq_lens
             max_seqlen_in_batch_q, max_seqlen_in_batch_k = max_seq_lens
-
-            attn_output_unpad = flash_attn_varlen_func(
+            # TODO: Currently not support Flash Attention
+            attn_output_unpad = F.flash_attn_unpadded(
                 query_states,
                 key_states,
                 value_states,
@@ -573,61 +524,62 @@ class Emu3FlashAttention2(Emu3Attention):
                 cu_seqlens_k=cu_seqlens_k,
                 max_seqlen_q=max_seqlen_in_batch_q,
                 max_seqlen_k=max_seqlen_in_batch_k,
-                dropout_p=dropout,
-                softmax_scale=softmax_scale,
+                dropout=dropout,
+                scale=softmax_scale,
                 causal=causal,
             )
+            return attn_output_unpad
+            # attn_output = pad_input(attn_output_unpad, indices_q, batch_size, query_length)
+        # else:
+        # attn_output = flash_attn_func(
+        #     query_states, key_states, value_states, dropout, softmax_scale=softmax_scale, causal=causal
+        # )
 
-            attn_output = pad_input(attn_output_unpad, indices_q, batch_size, query_length)
-        else:
-            attn_output = flash_attn_func(
-                query_states, key_states, value_states, dropout, softmax_scale=softmax_scale, causal=causal
-            )
+        # return attn_output
 
-        return attn_output
+    # def _upad_input(self, query_layer, key_layer, value_layer, attention_mask, query_length):
+    #     indices_k, cu_seqlens_k, max_seqlen_in_batch_k = _get_unpad_data(attention_mask)
+    #     batch_size, kv_seq_len, num_key_value_heads, head_dim = key_layer.shape
 
-    def _upad_input(self, query_layer, key_layer, value_layer, attention_mask, query_length):
-        indices_k, cu_seqlens_k, max_seqlen_in_batch_k = _get_unpad_data(attention_mask)
-        batch_size, kv_seq_len, num_key_value_heads, head_dim = key_layer.shape
+    #     key_layer = index_first_axis(
+    #         key_layer.reshape([batch_size * kv_seq_len, num_key_value_heads, head_dim]), indices_k
+    #     )
+    #     value_layer = index_first_axis(
+    #         value_layer.reshape([batch_size * kv_seq_len, num_key_value_heads, head_dim]), indices_k
+    #     )
+    #     if query_length == kv_seq_len:
+    #         query_layer = index_first_axis(
+    #             query_layer.reshape([batch_size * kv_seq_len, self.num_heads, head_dim]), indices_k
+    #         )
+    #         cu_seqlens_q = cu_seqlens_k
+    #         max_seqlen_in_batch_q = max_seqlen_in_batch_k
+    #         indices_q = indices_k
+    #     elif query_length == 1:
+    #         max_seqlen_in_batch_q = 1
+    #         cu_seqlens_q = paddle.arange(
+    #             batch_size + 1,
+    #             dtype=paddle.int32,
+    #         )  # There is a memcpy here, that is very bad.
+    #         indices_q = cu_seqlens_q[:-1]
+    #         query_layer = query_layer.squeeze(1)
+    #     else:
+    #         # The -q_len: slice assumes left padding.
+    #         attention_mask = attention_mask[:, -query_length:]
+    #         query_layer, indices_q, cu_seqlens_q, max_seqlen_in_batch_q = unpad_input(query_layer, attention_mask)
 
-        key_layer = index_first_axis(
-            key_layer.reshape([batch_size * kv_seq_len, num_key_value_heads, head_dim]), indices_k
-        )
-        value_layer = index_first_axis(
-            value_layer.reshape([batch_size * kv_seq_len, num_key_value_heads, head_dim]), indices_k
-        )
-        if query_length == kv_seq_len:
-            query_layer = index_first_axis(
-                query_layer.reshape([batch_size * kv_seq_len, self.num_heads, head_dim]), indices_k
-            )
-            cu_seqlens_q = cu_seqlens_k
-            max_seqlen_in_batch_q = max_seqlen_in_batch_k
-            indices_q = indices_k
-        elif query_length == 1:
-            max_seqlen_in_batch_q = 1
-            cu_seqlens_q = paddle.arange(
-                batch_size + 1, dtype=paddle.int32,
-            )  # There is a memcpy here, that is very bad.
-            indices_q = cu_seqlens_q[:-1]
-            query_layer = query_layer.squeeze(1)
-        else:
-            # The -q_len: slice assumes left padding.
-            attention_mask = attention_mask[:, -query_length:]
-            query_layer, indices_q, cu_seqlens_q, max_seqlen_in_batch_q = unpad_input(query_layer, attention_mask)
-
-        return (
-            query_layer,
-            key_layer,
-            value_layer,
-            indices_q,
-            (cu_seqlens_q, cu_seqlens_k),
-            (max_seqlen_in_batch_q, max_seqlen_in_batch_k),
-        )
+    #     return (
+    #         query_layer,
+    #         key_layer,
+    #         value_layer,
+    #         indices_q,
+    #         (cu_seqlens_q, cu_seqlens_k),
+    #         (max_seqlen_in_batch_q, max_seqlen_in_batch_k),
+    #     )
 
 
 EMU3_ATTENTION_CLASSES = {
     "eager": Emu3Attention,
-    #"flash_attention_2": Emu3FlashAttention2,
+    # "flash_attention_2": Emu3FlashAttention2,
 }
 
 
@@ -636,7 +588,9 @@ class Emu3DecoderLayer(nn.Layer):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.dropout = nn.Dropout(config.attention_dropout)
-        self.self_attn = Emu3Attention(config=config, layer_idx=layer_idx) #EMU3_ATTENTION_CLASSES[config._attn_implementation](config=config, layer_idx=layer_idx)
+        self.self_attn = Emu3Attention(
+            config=config, layer_idx=layer_idx
+        )  # EMU3_ATTENTION_CLASSES[config._attn_implementation](config=config, layer_idx=layer_idx)
 
         self.mlp = Emu3MLP(config)
         self.input_layernorm = Emu3RMSNorm(config.hidden_size, epsilon=config.rms_norm_eps)
@@ -712,9 +666,9 @@ class Emu3PreTrainedModel(PretrainedModel):
     supports_gradient_checkpointing = True
     _no_split_modules = ["Emu3DecoderLayer"]
     _skip_keys_device_placement = "past_key_values"
-    #_supports_flash_attn_2 = True
-    #_supports_sdpa = True
-    #_supports_cache_class = True
+    # _supports_flash_attn_2 = True
+    # _supports_sdpa = True
+    # _supports_cache_class = True
 
     # def _init_weights(self, module):
     #     std = self.config.initializer_range
@@ -746,13 +700,13 @@ class Emu3Model(Emu3PreTrainedModel):
         self.layers = nn.LayerList(
             [Emu3DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
-        self._use_sdpa = False #config._attn_implementation == "sdpa"
-        self._use_flash_attention_2 = False #config._attn_implementation == "flash_attention_2"
+        self._use_sdpa = False  # config._attn_implementation == "sdpa"
+        self._use_flash_attention_2 = False  # config._attn_implementation == "flash_attention_2"
         self.norm = Emu3RMSNorm(config.hidden_size, epsilon=config.rms_norm_eps)
 
         self.gradient_checkpointing = False
         # Initialize weights and apply final processing
-        #self.post_init()
+        # self.post_init()
 
     def get_input_embeddings(self):
         return self.embed_tokens
@@ -819,13 +773,6 @@ class Emu3Model(Emu3PreTrainedModel):
         else:
             raise ValueError("You have to specify either input_ids or inputs_embeds")
 
-        # past_key_values_length = 0
-        # if use_cache:
-        #     #use_legacy_cache = False #not isinstance(past_key_values, MultiHeadAttention.Cache)
-        #     #if use_legacy_cache:
-        #     #    past_key_values = MultiHeadAttention.DynamicCache.from_legacy_cache(past_key_values)
-        #     past_key_values_length = past_key_values.get_usable_length(seq_length)
-
         if past_key_values is None:
             past_key_values = tuple([None] * len(self.layers))
         # NOTE: to make cache can be clear in-time
@@ -849,25 +796,6 @@ class Emu3Model(Emu3PreTrainedModel):
             attention_mask, (batch_size, seq_length), cache_length, inputs_embeds.dtype
         )  # [bs, 1, seq_len, seq_len]
 
-        # if self._use_flash_attention_2:
-        #     # 2d mask is passed through the layers
-        #     attention_mask = attention_mask if (attention_mask is not None and 0 in attention_mask) else None
-        # # elif self._use_sdpa and not output_attentions:
-        # #     # output_attentions=True can not be supported when using SDPA, and we fall back on
-        # #     # the manual implementation that requires a 4D causal mask in all cases.
-        # #     attention_mask = _prepare_4d_causal_attention_mask_for_sdpa(
-        # #         attention_mask,
-        # #         (batch_size, seq_length),
-        # #         inputs_embeds,
-        # #         past_key_values_length,
-        # #     )
-        # else:
-        #     # 4d mask is passed through the layers
-        #     attention_mask = _prepare_4d_causal_attention_mask(
-        #         attention_mask, (batch_size, seq_length), inputs_embeds, past_key_values_length
-        #     )
-
-
         if cache_position is None:
             past_seen_tokens = past_key_values[0][0].shape[2] if past_key_values[0] is not None else 0
             cache_position = paddle.arange(past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1])
@@ -881,7 +809,7 @@ class Emu3Model(Emu3PreTrainedModel):
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
-        next_decoder_cache = () ###
+        next_decoder_cache = ()
 
         for idx, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
@@ -942,7 +870,7 @@ class Emu3ForCausalLM(Emu3PreTrainedModel):
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias_attr=False)
 
         # Initialize weights and apply final processing
-        #self.post_init()
+        # self.post_init()
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
@@ -981,80 +909,12 @@ class Emu3ForCausalLM(Emu3PreTrainedModel):
                 Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
                 config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
                 (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
-
-        Returns:
-
-        Example:
-
-        ```python
-        >>> from transformers import AutoTokenizer, AutoModel, AutoImageProcessor, AutoModelForCausalLM
-        >>> from transformers.generation.configuration_utils import GenerationConfig
-        >>> from transformers.generation import LogitsProcessorList, PrefixConstrainedLogitsProcessor, UnbatchedClassifierFreeGuidanceLogitsProcessor
-        >>> from transformers import Emu3Processor
-        >>> from PIL import Image
-
-        >>> model = AutoModelForCausalLM.from_pretrained(PATH_TO_CONVERTED_EMU3_WEIGHTS)
-        >>> tokenizer = AutoTokenizer.from_pretrained(PATH_TO_CONVERTED_TOKENIZER)
-        >>> image_processor = AutoImageProcessor.from_pretrained(PATH_TO_CONVERTED_IMAGE_PROCESSER)
-        >>> image_tokenizer = AutoModel.from_pretrained(PATH_TO_CONVERTED_TOKENIZER_WEIGHTS).eval()
-        >>> processor = Emu3Processor(image_processor, image_tokenizer, tokenizer)
-
-        >>> # Generation
-        >>> prompt = "An Emu in cartoon style, it is wearing sunglasses."
-
-        >>> pos_inputs = processor(text=prompt, mode='G', ratio="4:3", image_area=model.config.image_area, return_tensors="pt")
-        >>> neg_inputs = processor(text="", mode='G', ratio="4:3", image_area=model.config.image_area, return_tensors="pt")
-
-        >>> GENERATION_CONFIG = GenerationConfig(
-        >>>     use_cache=True,
-        >>>     eos_token_id=model.config.eos_token_id,
-        >>>     pad_token_id=model.config.pad_token_id,
-        >>>     max_new_tokens=40960,
-        >>>     do_sample=True,
-        >>>     top_k=2048,
-        >>> )
-
-        >>> h, w = pos_inputs.image_size[0]
-        >>> constrained_fn = processor.build_prefix_constrained_fn(h, w)
-        >>> logits_processor = LogitsProcessorList([
-        >>>     UnbatchedClassifierFreeGuidanceLogitsProcessor(
-        >>>         classifier_free_guidance, 
-        >>>         model,
-        >>>         unconditional_ids=neg_inputs.input_ids.to("cuda:0"),
-        >>>     ),
-        >>>     PrefixConstrainedLogitsProcessor(
-        >>>         constrained_fn,
-        >>>         num_beams=1,
-        >>>     ),
-        >>> ])
-
-        >>> outputs = model.generate(pos_inputs.input_ids.to("cuda:0"), GENERATION_CONFIG, logits_processor=logits_processor)
-        >>> generate_ids = model.generate(inputs.input_ids, max_length=30)
-        >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
-        >>> mm_list = processor.decode(outputs[0])
-
-        >>> # Understanding
-        >>> prompt = "Provide a one-sentence caption for the provided image."
-        >>> image = Image.open(TEST_IMAGE_PATH)
-
-        >>> inputs = processor(text=text, image=image, mode='U', padding_side="left", padding="longest", return_tensors="pt")
-        >>> input_ids = inputs.input_ids.to("cuda:0")
-        >>> GENERATION_CONFIG = GenerationConfig(
-        >>>     pad_token_id=tokenizer.pad_token_id,
-        >>>     bos_token_id=tokenizer.bos_token_id,
-        >>>     eos_token_id=tokenizer.eos_token_id,
-        >>> )
-
-        >>> outputs = model.generate(input_ids, GENERATION_CONFIG, max_new_tokens=100)
-        >>> outputs = outputs[:, input_ids.shape[-1]:]
-        >>> answer = processor.batch_decode(outputs, skip_special_tokens=True)
         ```"""
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs = self.model(
             input_ids=input_ids,
@@ -1072,8 +932,8 @@ class Emu3ForCausalLM(Emu3PreTrainedModel):
         try:
             logits = self.lm_head(hidden_states)
         except:
-            logits = self.lm_head(hidden_states.astype('bfloat16'))
-        logits = logits.astype(dtype='float32')
+            logits = self.lm_head(hidden_states.astype(self.lm_head.weight.dtype))
+        logits = logits.astype(dtype="float32")
 
         loss = None
         if labels is not None:
@@ -1081,7 +941,7 @@ class Emu3ForCausalLM(Emu3PreTrainedModel):
             shift_logits = logits[..., :-1, :]
             shift_labels = labels[..., 1:]
             # Flatten the tokens
-            #loss_fct = CrossEntropyLoss()
+            # loss_fct = CrossEntropyLoss()
             loss_fct = nn.CrossEntropyLoss(reduction="sum")
             shift_logits = shift_logits.reshape([-1, self.config.vocab_size])
             shift_labels = shift_labels.reshape([-1])
@@ -1104,7 +964,7 @@ class Emu3ForCausalLM(Emu3PreTrainedModel):
 
     def prepare_inputs_for_generation(
         self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, cache_position=None, **kwargs
-    ):  
+    ):
         batch_size, seq_length = input_ids.shape
         attention_mask = paddle.ones((batch_size, seq_length), dtype=paddle.bool)
 
@@ -1113,34 +973,11 @@ class Emu3ForCausalLM(Emu3PreTrainedModel):
             if past_length < input_ids.shape[1]:
                 input_ids = input_ids[:, past_length:]
 
-            # cache_length = past_length = past_key_values[0][0].shape[2]
-            # max_cache_length = None
-
-            # # Keep only the unprocessed tokens:
-            # # 1 - If the length of the attention_mask exceeds the length of input_ids, then we are in a setting where
-            # # some of the inputs are exclusivelly passed as part of the cache (e.g. when passing input_embeds as
-            # # input)
-            # if attention_mask is not None and attention_mask.shape[1] > input_ids.shape[1]:
-            #     input_ids = input_ids[:, -(attention_mask.shape[1] - past_length) :]
-            # # 2 - If the past_length is smaller than input_ids', then input_ids holds all input tokens. We can discard
-            # # input_ids based on the past_length.
-            # elif past_length < input_ids.shape[1]:
-            #     input_ids = input_ids[:, past_length:]
-            # # 3 - Otherwise (past_length >= input_ids.shape[1]), let's assume input_ids only has unprocessed tokens.
-
-            # # If we are about to go beyond the maximum cache length, we need to crop the input attention mask.
-            # if (
-            #     max_cache_length is not None
-            #     and attention_mask is not None
-            #     and cache_length + input_ids.shape[1] > max_cache_length
-            # ):
-            #     attention_mask = attention_mask[:, -max_cache_length:]
-
         # {'use_cache': True}
         position_ids = kwargs.get("position_ids", None)
         if attention_mask is not None and position_ids is None:
             # create position_ids on the fly for batch generation
-            position_ids = attention_mask.astype(dtype='int64').cumsum(-1) - 1
+            position_ids = attention_mask.astype(dtype="int64").cumsum(-1) - 1
             position_ids.masked_fill_(attention_mask == 0, 1)
             if past_key_values:
                 position_ids = position_ids[:, -input_ids.shape[1] :]
@@ -1160,3 +997,19 @@ class Emu3ForCausalLM(Emu3PreTrainedModel):
             }
         )
         return model_inputs
+
+    def get_logits_processor(
+        self,
+        min_length=None,
+        max_length=None,
+        eos_token_id=None,
+        forced_bos_token_id=None,
+        forced_eos_token_id=None,
+        num_beams=1,
+        num_beam_groups=1,
+        diversity_rate=0.0,
+        repetition_penalty=None,
+        no_repeat_ngram_size=None,
+        logits_processors=None,
+    ):
+        return logits_processors

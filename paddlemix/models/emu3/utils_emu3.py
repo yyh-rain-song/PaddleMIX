@@ -1,17 +1,96 @@
+# Copyright (c) 2024 PaddlePaddle Authors. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+""" Logits Processor Helper class for Emu3. """
+from typing import List, Optional, Union
+
 import paddle
-from PIL import Image
-from paddlenlp.generation import GenerationConfig
-from paddlemix.models.emu3.mllm.modeling_emu3 import Emu3ForCausalLM
-from paddlemix.models.emu3.mllm.tokenization_emu3 import Emu3Tokenizer
-from paddlemix.models.emu3.tokenizer import Emu3VisionVQModel
-from paddlemix.models.emu3.mllm.processing_emu3 import Emu3Processor
-from paddlemix.models.emu3.tokenizer.image_processing_emu3visionvq import Emu3VisionVQImageProcessor
-from paddlemix.models.emu3.mllm.processing_emu3 import Emu3Processor
-from paddlenlp.generation import LogitsProcessorList
-from paddlenlp.generation.logits_process import LogitsProcessor, PrefixConstrainedLogitsProcessor
+from paddlenlp.generation import LogitsProcessor, StoppingCriteria
 
 
-from typing import Dict, List, Optional, Union
+class Emu3PrefixConstrainedLogitsHelper:
+    def __init__(
+        self,
+        height,
+        width,
+        img_token,
+        eoi_token,
+        eos_token,
+        eol_token,
+        eof_token,
+        pad_token,
+        visual_tokens,
+    ):
+        self.height = height
+        self.width = width
+        self.img_token = img_token
+        self.eoi_token = eoi_token
+        self.eos_token = eos_token
+        self.eol_token = eol_token
+        self.eof_token = eof_token
+        self.pad_token = pad_token
+        self.visual_tokens = visual_tokens
+
+        self.offset_cache = {}
+
+    def __call__(self, batch_id, input_ids):
+        if batch_id not in self.offset_cache:
+            position = paddle.nonzero(input_ids == self.img_token, as_tuple=True)[0][0]
+            self.offset_cache[batch_id] = position
+
+        height = self.height[batch_id] if self.height.shape[0] > 1 else self.height[0]
+        width = self.width[batch_id] if self.width.shape[0] > 1 else self.width[0]
+
+        offset = input_ids.shape[0] - self.offset_cache[batch_id]
+        # height = height.to(offset.device)
+        # width = width.to(offset.device)
+
+        if offset % (width + 1) == 0:
+            return (self.eol_token,)
+        elif offset == (width + 1) * height + 1:
+            return (self.eof_token,)
+        elif offset == (width + 1) * height + 2:
+            return (self.eoi_token,)
+        elif offset == (width + 1) * height + 3:
+            return (self.eos_token,)
+        elif offset > (width + 1) * height + 3:
+            return (self.pad_token,)
+        else:
+            return self.visual_tokens
+
+
+class EosTokenCriteria(StoppingCriteria):
+    """
+    This class can be used to stop generation whenever the "end-of-sequence" token is generated.
+    By default, it uses the `model.generation_config.eos_token_id`.
+
+    Args:
+        eos_token_id (`Union[int, List[int], torch.Tensor]`):
+            The id(s) of the *end-of-sequence* token.
+    """
+
+    def __init__(self, eos_token_id: Union[int, List[int], paddle.Tensor]):
+        if not isinstance(eos_token_id, paddle.Tensor):
+            if isinstance(eos_token_id, int):
+                eos_token_id = [eos_token_id]
+            eos_token_id = paddle.to_tensor(eos_token_id)
+        self.eos_token_id = eos_token_id
+
+    def __call__(self, input_ids: paddle.Tensor, scores: paddle.Tensor, **kwargs) -> paddle.Tensor:
+        self.eos_token_id = self.eos_token_id.to(input_ids.place)
+        # is_done = isin_mps_friendly(input_ids[:, -1], self.eos_token_id)
+        is_done = paddle.isin(input_ids[:, -1], self.eos_token_id)
+        return is_done
 
 
 class UnbatchedClassifierFreeGuidanceLogitsProcessor(LogitsProcessor):
@@ -31,10 +110,10 @@ class UnbatchedClassifierFreeGuidanceLogitsProcessor(LogitsProcessor):
         model (`PreTrainedModel`):
             The model computing the unconditional scores. Supposedly the same as the one computing the conditional
             scores. Both models must use the same tokenizer.
-        unconditional_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
+        unconditional_ids (`paddle.Tensor` of shape `(batch_size, sequence_length)`, *optional*):
             Indices of input sequence tokens in the vocabulary for the unconditional branch. If unset, will default to
             the last token of the prompt.
-        unconditional_attention_mask (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
+        unconditional_attention_mask (`paddle.Tensor` of shape `(batch_size, sequence_length)`, *optional*):
             Attention mask for unconditional_ids.
         use_cache (`bool`, *optional*, defaults to `True`):
             Whether to cache key/values during the negative prompt forward pass.
@@ -115,6 +194,7 @@ class UnbatchedClassifierFreeGuidanceLogitsProcessor(LogitsProcessor):
             attention_mask=attention_mask,
             use_cache=self.unconditional_context["use_cache"],
             past_key_values=self.unconditional_context["past_key_values"],
+            return_dict=True,
         )
         self.unconditional_context["past_key_values"] = out.get("past_key_values", None)
 
@@ -130,77 +210,3 @@ class UnbatchedClassifierFreeGuidanceLogitsProcessor(LogitsProcessor):
         unconditional_logits = paddle.nn.functional.log_softmax(logits[:, -1], axis=-1)
         scores_processed = self.guidance_scale * (scores - unconditional_logits) + unconditional_logits
         return scores_processed
-
-
-# model path
-EMU_HUB = "BAAI/Emu3-Gen"
-VQ_HUB = "BAAI/Emu3-VisionTokenizer"
-
-# prepare model and processor
-model = Emu3ForCausalLM.from_pretrained(EMU_HUB, dtype=paddle.bfloat16).eval()
-tokenizer = Emu3Tokenizer.from_pretrained(EMU_HUB, padding_side="left")
-
-image_processor = Emu3VisionVQImageProcessor.from_pretrained(VQ_HUB)
-image_tokenizer = Emu3VisionVQModel.from_pretrained(VQ_HUB).eval()
-
-processor = Emu3Processor(image_processor, image_tokenizer, tokenizer)
-
-# prepare input
-POSITIVE_PROMPT = " masterpiece, film grained, best quality."
-NEGATIVE_PROMPT = "lowres, bad anatomy, bad hands, text, error, missing fingers, extra digit, fewer digits, cropped, worst quality, low quality, normal quality, jpeg artifacts, signature, watermark, username, blurry."
-
-classifier_free_guidance = 3.0
-prompt = ["a portrait of young girl.", "a shiba inu"]
-prompt = [p + POSITIVE_PROMPT for p in prompt]
-
-kwargs = dict(
-    mode='G',
-    ratio=["1:1", "16:9"],
-    image_area=model.config.image_area,
-    return_tensors="pd",
-    padding="longest",
-)
-pos_inputs = processor(text=prompt, **kwargs)
-neg_inputs = processor(text=[NEGATIVE_PROMPT] * len(prompt), **kwargs)
-#import pdb; pdb.set_trace()
-
-# prepare hyper parameters
-GENERATION_CONFIG = GenerationConfig(
-    use_cache=True,
-    eos_token_id=model.config.eos_token_id,
-    pad_token_id=model.config.pad_token_id,
-    max_new_tokens=40960,
-    do_sample=True,
-    top_k=2048,
-)
-
-h = pos_inputs.image_size[:, 0]
-w = pos_inputs.image_size[:, 1]
-constrained_fn = processor.build_prefix_constrained_fn(h, w)
-logits_processor = LogitsProcessorList([
-    UnbatchedClassifierFreeGuidanceLogitsProcessor(
-        classifier_free_guidance,
-        model,
-        unconditional_ids=neg_inputs.input_ids,
-    ),
-    PrefixConstrainedLogitsProcessor(
-        constrained_fn ,
-        num_beams=1,
-    ),
-])
-
-# generate
-outputs = model.generate(
-    pos_inputs.input_ids,
-    GENERATION_CONFIG,
-    logits_processor=logits_processor,
-    #attention_mask=pos_inputs.attention_mask,
-)
-print('outputs', outputs)
-
-for idx_i, out in enumerate(outputs[0]):
-    mm_list = processor.decode(out)
-    for idx_j, im in enumerate(mm_list):
-        if not isinstance(im, Image.Image):
-            continue
-        im.save(f"result_{idx_i}_{idx_j}.png")

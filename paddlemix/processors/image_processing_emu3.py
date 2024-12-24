@@ -15,19 +15,21 @@
 
 
 import math
-from typing import Dict, List, Optional, Union
+from typing import List, Optional, Union
 
 import numpy as np
-
-from paddlenlp.transformers.image_processing_utils import BaseImageProcessor, BatchFeature
+from paddlenlp.transformers.image_processing_utils import (
+    BaseImageProcessor,
+    BatchFeature,
+)
 from paddlenlp.transformers.image_transforms import (
     convert_to_rgb,
-    resize,
     normalize,
     rescale,
+    resize,
     to_channel_dimension_format,
 )
-from paddlenlp.transformers.image_utils import (
+from paddlenlp.transformers.image_utils import (  # is_scaled_image,; validate_preprocess_arguments,
     IMAGENET_STANDARD_MEAN,
     IMAGENET_STANDARD_STD,
     ChannelDimension,
@@ -35,24 +37,21 @@ from paddlenlp.transformers.image_utils import (
     PILImageResampling,
     get_image_size,
     infer_channel_dimension_format,
-    # is_scaled_image,
     make_list_of_images,
     to_numpy_array,
     valid_images,
-    # validate_preprocess_arguments,
 )
-from PIL import Image
-# from paddlenlp.transformers.utils import TensorType, is_vision_available, logging
 from paddlenlp.transformers.tokenizer_utils_base import TensorType
+from PIL import Image
 
 from ppdiffusers.utils import logging
+
 logger = logging.get_logger(__name__)
 
+__all__ = ["Emu3VisionVQImageProcessor"]
 
 
-def smart_resize(
-    height: int, width: int, factor: int = 8, min_pixels: int = 512 * 512, max_pixels: int = 1024 * 1024
-):
+def smart_resize(height: int, width: int, factor: int = 8, min_pixels: int = 512 * 512, max_pixels: int = 1024 * 1024):
     """Rescales the image so that the following conditions are met:
 
     1. Both dimensions (height and width) are divisible by 'factor'.
@@ -232,9 +231,7 @@ class Emu3VisionVQImageProcessor(BaseImageProcessor):
                 image = rescale(image, scale=rescale_factor, data_format=input_data_format)
 
             if do_normalize:
-                image = normalize(
-                    image=image, mean=image_mean, std=image_std, data_format=input_data_format
-                )
+                image = normalize(image=image, mean=image_mean, std=image_std, data_format=input_data_format)
 
             image = to_channel_dimension_format(image, output_data_format, input_channel_dim=input_data_format)
             processed_images.append(image)

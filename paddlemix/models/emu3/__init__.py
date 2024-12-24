@@ -12,9 +12,5 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .configuration_emu3visionvq import Emu3VisionVQConfig
-from .modeling_emu3visionvq import (
-    Emu3VisionVQModel,
-    Emu3VisionVQPretrainedModel
-)
-from .image_processing_emu3visionvq import Emu3VisionVQImageProcessor
+from .modeling_emu3 import Emu3ForCausalLM
+from .modeling_emu3visionvq import Emu3VisionVQModel
