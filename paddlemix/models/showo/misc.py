@@ -12,16 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import Any, Optional, Union
+
 import paddle
-from omegaconf import OmegaConf
-from typing import Any, Callable, Dict, Iterable, List, NamedTuple, NewType, Optional, Sized, Tuple, Type, TypeVar, Union
-# try:
-#     from typing import Literal
-# except ImportError:
-#     from typing_extensions import Literal
-#from jaxtyping import Bool, Complex, Float, Inexact, Int, Integer, Num, Shaped, UInt
-from omegaconf import DictConfig
-#from typeguard import typechecked as typechecker
+from omegaconf import DictConfig, OmegaConf
 
 
 def broadcast(tensor, src=0):
@@ -36,9 +30,8 @@ def _distributed_available():
     return paddle.distributed.is_available() and paddle.distributed.is_initialized()
 
 
-def parse_structured(fields: Any, cfg: Optional[Union[dict, DictConfig]]=None
-    ) ->Any:
-    if '--local-rank' in cfg:
-        del cfg['--local-rank']
+def parse_structured(fields: Any, cfg: Optional[Union[dict, DictConfig]] = None) -> Any:
+    if "--local-rank" in cfg:
+        del cfg["--local-rank"]
     scfg = OmegaConf.structured(fields(**cfg))
     return scfg

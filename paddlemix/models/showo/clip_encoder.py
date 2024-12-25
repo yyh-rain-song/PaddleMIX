@@ -18,7 +18,7 @@ from paddlenlp.transformers import CLIPVisionModel, CLIPImageProcessor, CLIPVisi
 
 
 class CLIPVisionTower(nn.Layer):
-    def __init__(self, vision_tower):
+    def __init__(self, vision_tower,dtype="float32"):
         super().__init__()
 
         self.is_loaded = False
@@ -26,16 +26,16 @@ class CLIPVisionTower(nn.Layer):
         self.vision_tower_name = vision_tower
         self.select_layer = -2
         self.select_feature = "patch"
-        self.load_model()
-        self.cfg_only = CLIPVisionConfig.from_pretrained(self.vision_tower_name)
+        self.load_model(dtype)
+        self.cfg_only = CLIPVisionConfig.from_pretrained(self.vision_tower_name,dtype=dtype)
 
-    def load_model(self):
+    def load_model(self,dtype="float32"):
         if self.is_loaded:
             print('{} is already loaded, `load_model` called again, skipping.'.format(self.vision_tower_name))
             return
 
         self.image_processor = CLIPImageProcessor.from_pretrained(self.vision_tower_name)
-        self.vision_tower = CLIPVisionModel.from_pretrained(self.vision_tower_name)
+        self.vision_tower = CLIPVisionModel.from_pretrained(self.vision_tower_name,dtype=dtype)
         self.vision_tower.stop_gradient = True
 
         self.is_loaded = True

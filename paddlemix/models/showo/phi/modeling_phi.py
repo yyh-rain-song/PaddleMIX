@@ -18,22 +18,20 @@ from typing import List, Optional, Tuple, Union
 
 import paddle
 import paddle.nn.functional as F
-from paddle.nn.functional.flash_attention import flash_attention as flash_attn_func
 from paddle import nn
+from paddle.nn.functional.flash_attention import flash_attention as flash_attn_func
 from paddlenlp.transformers.activations import ACT2FN
-#from ...activations import ACT2FN
-from paddle.nn import MultiHeadAttention
 from paddlenlp.transformers.model_outputs import (
     BaseModelOutputWithPast,
     CausalLMOutputWithPast,
 )
 from paddlenlp.transformers.model_utils import PretrainedModel
 
-from .configuration_phi import PhiConfig
 from ppdiffusers.utils import logging
-logger = logging.get_logger(__name__)
 
-from paddlenlp.transformers.configuration_utils import PretrainedConfig
+from .configuration_phi import PhiConfig
+
+logger = logging.get_logger(__name__)
 
 
 class PhiRotaryEmbedding(nn.Layer):
@@ -47,13 +45,13 @@ class PhiRotaryEmbedding(nn.Layer):
         self.dim = dim
         self.max_position_embeddings = max_position_embeddings
         self.base = base
-        inv_freq = 1.0 / (self.base ** (paddle.arange(0, self.dim, 2, dtype=paddle.int64).astype('float32') / self.dim))
+        inv_freq = 1.0 / (
+            self.base ** (paddle.arange(0, self.dim, 2, dtype=paddle.int64).astype("float32") / self.dim)
+        )
         self.register_buffer("inv_freq", inv_freq, persistable=False)
 
         # Build here to make `torch.jit.trace` work.
-        self._set_cos_sin_cache(
-            seq_len=max_position_embeddings, dtype=paddle.float32
-        )
+        self._set_cos_sin_cache(seq_len=max_position_embeddings, dtype=paddle.float32)
 
     def _set_cos_sin_cache(self, seq_len, dtype):
         self.max_seq_len_cached = int(seq_len)
@@ -161,10 +159,12 @@ class PhiAttention(nn.Layer):
         self.qk_layernorm = config.qk_layernorm
         if self.qk_layernorm:
             self.q_layernorm = nn.LayerNorm(
-                config.hidden_size // self.num_heads, epsilon=config.layer_norm_eps,
+                config.hidden_size // self.num_heads,
+                epsilon=config.layer_norm_eps,
             )
             self.k_layernorm = nn.LayerNorm(
-                config.hidden_size // self.num_heads, epsilon=config.layer_norm_eps,
+                config.hidden_size // self.num_heads,
+                epsilon=config.layer_norm_eps,
             )
         self._init_rope()
 
@@ -177,21 +177,21 @@ class PhiAttention(nn.Layer):
 
     def forward(
         self,
-        hidden_states: paddle.Tensor, # [1, 1043, 2048]
-        attention_mask: Optional[paddle.Tensor] = None, # [1, 1, 1043, 1043]
-        position_ids: Optional[paddle.Tensor] = None, # [3, 1, 1043]
-        past_key_value: Optional[MultiHeadAttention.Cache] = None,
+        hidden_states: paddle.Tensor,  # [1, 1043, 2048]
+        attention_mask: Optional[paddle.Tensor] = None,  # [1, 1, 1043, 1043]
+        position_ids: Optional[paddle.Tensor] = None,  # [3, 1, 1043]
+        past_key_value: Optional[Tuple[paddle.Tensor]] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
     ) -> Tuple[paddle.Tensor, Optional[paddle.Tensor], Optional[Tuple[paddle.Tensor]]]:
         bsz, q_len, _ = hidden_states.shape
 
         try:
-            query_states = self.q_proj(hidden_states) # [1, 1043, 2048]
+            query_states = self.q_proj(hidden_states)  # [1, 1043, 2048]
             key_states = self.k_proj(hidden_states)
             value_states = self.v_proj(hidden_states)
         except:
-            hidden_states = hidden_states.astype("bfloat16")
+            hidden_states = hidden_states.astype(self.q_proj.weight.dtype)
             query_states = self.q_proj(hidden_states)
             key_states = self.k_proj(hidden_states)
             value_states = self.v_proj(hidden_states)
@@ -251,7 +251,7 @@ class PhiAttention(nn.Layer):
             attn_weights = attn_weights + attention_mask
 
         # upcast attention to fp32
-        attn_weights = nn.functional.softmax(attn_weights, axis=-1, dtype=paddle.float32) #.to(value_states.dtype)
+        attn_weights = nn.functional.softmax(attn_weights, axis=-1, dtype=paddle.float32)  # .to(value_states.dtype)
         attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
 
         attn_output = paddle.matmul(attn_weights.cast(self.config.dtype), value_states.cast(self.config.dtype))
@@ -262,9 +262,8 @@ class PhiAttention(nn.Layer):
                 f" {attn_output.shape}"
             )
 
-        attn_output = attn_output.transpose([0, 2, 1, 3]) #.transpose(1, 2)
+        attn_output = attn_output.transpose([0, 2, 1, 3])  # .transpose(1, 2)
         attn_output = attn_output.reshape([bsz, q_len, self.hidden_size])
-
         attn_output = self.dense(attn_output.cast(paddle.float32))
 
         if not output_attentions:
@@ -282,7 +281,7 @@ class PhiSdpaAttention(PhiAttention):
         hidden_states: paddle.Tensor,
         attention_mask: Optional[paddle.Tensor] = None,
         position_ids: Optional[paddle.Tensor] = None,
-        past_key_value: Optional[MultiHeadAttention.Cache] = None,
+        past_key_value: Optional[paddle.Tensor] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
     ) -> Tuple[paddle.Tensor, Optional[paddle.Tensor], Optional[Tuple[paddle.Tensor]]]:
@@ -310,14 +309,16 @@ class PhiSdpaAttention(PhiAttention):
             key_states = self.k_proj(hidden_states)
             value_states = self.v_proj(hidden_states)
         except:
-            hidden_states = hidden_states.astype("bfloat16")
+            hidden_states = hidden_states.astype(self.q_proj.weight.dtype)
             query_states = self.q_proj(hidden_states)
             key_states = self.k_proj(hidden_states)
             value_states = self.v_proj(hidden_states)
 
         query_states = query_states.reshape([bsz, q_len, self.num_heads, self.head_dim]).transpose([0, 2, 1, 3])
         key_states = key_states.reshape([bsz, q_len, self.num_key_value_heads, self.head_dim]).transpose([0, 2, 1, 3])
-        value_states = value_states.reshape([bsz, q_len, self.num_key_value_heads, self.head_dim]).transpose([0, 2, 1, 3])
+        value_states = value_states.reshape([bsz, q_len, self.num_key_value_heads, self.head_dim]).transpose(
+            [0, 2, 1, 3]
+        )
 
         if self.qk_layernorm:
             query_states = self.q_layernorm(query_states)
@@ -357,21 +358,22 @@ class PhiSdpaAttention(PhiAttention):
 
         is_causal = True if self.is_causal and attention_mask is None and q_len > 1 else False
 
-        ### NOTE: 先transpose，过完flashattention后不用再transpose了
+        # NOTE: 先transpose，过完flashattention后不用再transpose了
         query_states = query_states.transpose(perm=[0, 2, 1, 3])
         key_states = key_states.transpose(perm=[0, 2, 1, 3])
         value_states = value_states.transpose(perm=[0, 2, 1, 3])
 
         original_dtype = query_states.dtype
-        query_states = query_states.astype('bfloat16')
-        key_states = key_states.astype('bfloat16')
-        value_states = value_states.astype('bfloat16')
+        query_states = query_states.astype(self.q_proj.weight.dtype)
+        key_states = key_states.astype(self.q_proj.weight.dtype)
+        value_states = value_states.astype(self.q_proj.weight.dtype)
         attn_output = self._flash_attention_forward(
-            query_states, # [1, 620, 32, 64] sum -44201.13671875
-            key_states, # [1, 620, 32, 64] sum 153207.93750000
-            value_states, # [1, 620, 32, 64] sum -734.87115479
-            attention_mask, # [1, 1, 620, 620]
-            q_len, # 620
+            query_states,  # [1, 620, 32, 64] sum -44201.13671875
+            key_states,  # [1, 620, 32, 64] sum 153207.93750000
+            value_states,  # [1, 620, 32, 64] sum -734.87115479
+            attention_mask,  # [1, 1, 620, 620]
+            q_len,  # 620
+            is_causal=is_causal,
         )
         attn_output = attn_output.astype(original_dtype)
         attn_output = attn_output.reshape([bsz, q_len, self.hidden_size])
@@ -379,39 +381,53 @@ class PhiSdpaAttention(PhiAttention):
         return attn_output, None, past_key_value
 
     def _flash_attention_forward(
-        self, query_states, key_states, value_states, attention_mask, query_length, dropout=0.0, softmax_scale=None
+        self,
+        query_states,
+        key_states,
+        value_states,
+        attention_mask,
+        query_length,
+        dropout=0.0,
+        softmax_scale=None,
+        is_causal=False,
     ):
         # Contains at least one padding token in the sequence
-        causal = self.is_causal and query_length != 1
+        # head_dim = query_states.shape[-1]
+        # softmax_scale = head_dim**-0.5  # TODO: 需要手动加上
 
-        head_dim = query_states.shape[-1]
-        softmax_scale = head_dim**-0.5  # TODO: 需要手动加上
-
-        if 0: #attention_mask is not None:
-            pass
-        else:
+        if is_causal:  # attention_mask is not None:
             attn_output = flash_attn_func(
                 query_states,
                 key_states,
                 value_states,
                 dropout,
-                causal=causal,  # no softmax_scale=
+                causal=is_causal,  # no softmax_scale=
             )[0]
-
+        else:
+            attn_output = F.scaled_dot_product_attention(
+                query_states,
+                key_states,
+                value_states,
+                attn_mask=attention_mask.astype(query_states.dtype),
+                dropout_p=dropout,
+                training=self.training,
+            )
         return attn_output
 
 
 PHI_ATTENTION_CLASSES = {
-    'eager': PhiAttention,
-    'flash_attention_2': PhiSdpaAttention,
-    'sdpa': PhiSdpaAttention,
+    "eager": PhiAttention,
+    "flash_attention_2": PhiSdpaAttention,
+    "sdpa": PhiSdpaAttention,
 }
 
 
 class PhiDecoderLayer(nn.Layer):
     def __init__(self, config: PhiConfig, layer_idx: int):
         super().__init__()
-        self.self_attn = PhiSdpaAttention(config, layer_idx=layer_idx) # PHI_ATTENTION_CLASSES[config._attn_implementation](config, layer_idx=layer_idx)
+        self.self_attn = PhiSdpaAttention(
+            config, layer_idx=layer_idx
+        )  # PHI_ATTENTION_CLASSES[config._attn_implementation](config, layer_idx=layer_idx)
         self.mlp = PhiMLP(config)
         self.input_layernorm = nn.LayerNorm(config.hidden_size, epsilon=config.layer_norm_eps)
         self.resid_dropout = nn.Dropout(config.resid_pdrop)
@@ -455,9 +471,7 @@ class PhiDecoderLayer(nn.Layer):
         residual = hidden_states
 
         hidden_states = self.input_layernorm(hidden_states)
-
         # Self Attention
-        #import pdb; pdb.set_trace()
         attn_outputs, self_attn_weights, present_key_value = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
@@ -466,7 +480,6 @@ class PhiDecoderLayer(nn.Layer):
             output_attentions=output_attentions,
             use_cache=use_cache,
         )
-        #import pdb; pdb.set_trace()
         attn_outputs = self.resid_dropout(attn_outputs)
 
         feed_forward_hidden_states = self.resid_dropout(self.mlp(hidden_states))
@@ -492,7 +505,7 @@ class PhiPreTrainedModel(PretrainedModel):
     # _supports_sdpa = True
     # _supports_cache_class = True
     # _supports_static_cache = True
-    #_supports_quantized_cache = True
+    # _supports_quantized_cache = True
 
     # def _init_weights(self, module):
     #     std = self.config.initializer_range
@@ -539,7 +552,7 @@ class PhiModel(PhiPreTrainedModel):
 
         self.gradient_checkpointing = False
         # Initialize weights and apply final processing
-        #self.post_init()
+        # self.post_init()
 
     def get_input_embeddings(self):
         return self.embed_tokens
@@ -549,15 +562,15 @@ class PhiModel(PhiPreTrainedModel):
 
     def forward(
         self,
-        input_ids: paddle.Tensor = None, # [2, 1155]
+        input_ids: paddle.Tensor = None,  # [2, 1155]
         attention_mask: Optional[paddle.Tensor] = None,
-        position_ids: Optional[paddle.Tensor] = None, # [1, 1155]
-        past_key_values: Optional[List[paddle.Tensor]] = None, # none
-        inputs_embeds: Optional[paddle.Tensor] = None, # [2, 1155, 2048] -521.95941162
-        use_cache: Optional[bool] = None, # false
-        output_attentions: Optional[bool] = None, # false
-        output_hidden_states: Optional[bool] = None, # false
-        return_dict: Optional[bool] = None, # true
+        position_ids: Optional[paddle.Tensor] = None,  # [1, 1155]
+        past_key_values: Optional[List[paddle.Tensor]] = None,  # none
+        inputs_embeds: Optional[paddle.Tensor] = None,  # [2, 1155, 2048] -521.95941162
+        use_cache: Optional[bool] = None,  # false
+        output_attentions: Optional[bool] = None,  # false
+        output_hidden_states: Optional[bool] = None,  # false
+        return_dict: Optional[bool] = None,  # true
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -594,7 +607,7 @@ class PhiModel(PhiPreTrainedModel):
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
-        next_decoder_cache = None
+        # next_decoder_cache = None
 
         for idx, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
@@ -610,15 +623,16 @@ class PhiModel(PhiPreTrainedModel):
             )
 
             hidden_states = layer_outputs[0]
-            #print('hidden_states', idx, hidden_states.sum().item())
+            # import pdb;pdb.set_trace()
+            # print('hidden_states', idx, hidden_states.sum().item())
 
             # next_decoder_cache = None # next_decoder_cache + (layer_outputs[-1],) if use_cache else None
 
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
 
-        #print('hidden_states end', hidden_states.sum().item())
-        #import pdb; pdb.set_trace()
+        # print('hidden_states end', hidden_states.sum().item())
+        # import pdb; pdb.set_trace()
         # [2, 1155, 2048] 448886.62500000
         hidden_states = self.final_layernorm(hidden_states)
 
@@ -642,7 +656,7 @@ class PhiModel(PhiPreTrainedModel):
         attention_mask: paddle.Tensor,
         input_tensor: paddle.Tensor,
         cache_position: paddle.Tensor,
-        past_key_values: MultiHeadAttention.Cache,
+        past_key_values: Optional[paddle.Tensor],
         output_attentions: bool,
     ):
 
@@ -650,7 +664,7 @@ class PhiModel(PhiPreTrainedModel):
         # order to dispatch on Flash Attention 2. This feature is not compatible with static cache, as SDPA will fail
         # to infer the attention mask.
         past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
-        using_static_cache = False # isinstance(past_key_values, StaticCache)
+        using_static_cache = False  # isinstance(past_key_values, StaticCache)
 
         dtype = input_tensor.dtype
         sequence_length = input_tensor.shape[1]
@@ -712,7 +726,9 @@ class PhiModel(PhiPreTrainedModel):
         else:
             min_dtype = paddle.finfo(dtype).min
             causal_mask = paddle.full(
-                (sequence_length, target_length), fill_value=min_dtype, dtype=dtype,
+                (sequence_length, target_length),
+                fill_value=min_dtype,
+                dtype=dtype,
             )
             if sequence_length != 1:
                 causal_mask = paddle.triu(causal_mask, diagonal=1)
@@ -732,18 +748,18 @@ class PhiModel(PhiPreTrainedModel):
 
 class PhiForCausalLM(PhiPreTrainedModel):
     _tied_weights_keys = ["lm_head.weight"]
+
     def __init__(self, config):
         super().__init__(config)
         config.qk_layernorm = True
         config.use_cache = False
-
-        self.model = PhiModel(config)
+        self.model = PhiModel(config).to(dtype=config.dtype)
         self.vocab_size = config.vocab_size
-        #self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias_attr=True)
-        self.lm_head = nn.Linear(config.hidden_size, 58498, bias_attr=True) # TODO: 58498 resize
+        # self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias_attr=True)
+        self.lm_head = nn.Linear(config.hidden_size, 58498, bias_attr=True)  # TODO: 58498 resize
 
         # Initialize weights and apply final processing
-        #self.post_init()
+        # self.post_init()
 
     # Copied from transformers.models.llama.modeling_llama.LlamaForCausalLM.get_input_embeddings
     def get_input_embeddings(self):
@@ -813,14 +829,13 @@ class PhiForCausalLM(PhiPreTrainedModel):
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds, # [1, 620, 2048] -19089.80859375
+            inputs_embeds=inputs_embeds,  # [1, 620, 2048] -19089.80859375
             use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
@@ -829,7 +844,7 @@ class PhiForCausalLM(PhiPreTrainedModel):
 
         hidden_states = outputs[0]
         logits = self.lm_head(hidden_states)
-        logits = logits.astype(dtype='float32')
+        logits = logits.astype(dtype="float32")
 
         loss = None
         if labels is not None:
@@ -837,7 +852,7 @@ class PhiForCausalLM(PhiPreTrainedModel):
             shift_logits = logits[..., :-1, :]
             shift_labels = labels[..., 1:]
             # Flatten the tokens
-            #loss_fct = CrossEntropyLoss()
+            # loss_fct = CrossEntropyLoss()
             loss_fct = nn.CrossEntropyLoss(reduction="sum")
             shift_logits = shift_logits.reshape([-1, self.config.vocab_size])
             shift_labels = shift_labels.reshape([-1])
@@ -872,7 +887,7 @@ class PhiForCausalLM(PhiPreTrainedModel):
         position_ids = kwargs.get("position_ids", None)
         if attention_mask is not None and position_ids is None:
             # create position_ids on the fly for batch generation
-            position_ids = attention_mask.astype(dtype='int64').cumsum(-1) - 1
+            position_ids = attention_mask.astype(dtype="int64").cumsum(-1) - 1
             position_ids.masked_fill_(attention_mask == 0, 1)
             if past_key_values:
                 position_ids = position_ids[:, -input_ids.shape[1] :]
